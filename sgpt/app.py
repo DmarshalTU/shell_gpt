@@ -1,24 +1,22 @@
-"""
-This module provides a simple interface for OpenAI API using Typer
-as the command line interface. It supports different modes of output including
-shell commands and code, and allows users to specify the desired OpenAI model
-and length and other options of the output. Additionally, it supports executing
-shell commands directly from the interface.
-"""
 # To allow users to use arrow keys in the REPL.
 import readline  # noqa: F401
 import sys
 
 import typer
 from click import BadArgumentUsage, MissingParameter
+from click.types import Choice
 
-from sgpt.client import OpenAIClient
 from sgpt.config import cfg
 from sgpt.handlers.chat_handler import ChatHandler
 from sgpt.handlers.default_handler import DefaultHandler
 from sgpt.handlers.repl_handler import ReplHandler
 from sgpt.role import DefaultRoles, SystemRole
-from sgpt.utils import ModelOptions, get_edited_prompt, run_command
+from sgpt.utils import (
+    get_edited_prompt,
+    get_sgpt_version,
+    install_shell_integration,
+    run_command,
+)
 
 
 def main(
@@ -27,19 +25,19 @@ def main(
         show_default=False,
         help="The prompt to generate completions for.",
     ),
-    model: ModelOptions = typer.Option(
-        ModelOptions(cfg.get("DEFAULT_MODEL")).value,
-        help="OpenAI GPT model to use.",
+    model: str = typer.Option(
+        cfg.get("DEFAULT_MODEL"),
+        help="Large language model to use.",
     ),
     temperature: float = typer.Option(
-        0.1,
+        0.0,
         min=0.0,
         max=2.0,
         help="Randomness of generated output.",
     ),
     top_probability: float = typer.Option(
         1.0,
-        min=0.1,
+        min=0.0,
         max=1.0,
         help="Limits highest probable tokens (words).",
     ),
@@ -48,6 +46,13 @@ def main(
         "--shell",
         "-s",
         help="Generate and execute shell commands.",
+        rich_help_panel="Assistance Options",
+    ),
+    describe_shell: bool = typer.Option(
+        False,
+        "--describe-shell",
+        "-d",
+        help="Describe a shell command.",
         rich_help_panel="Assistance Options",
     ),
     code: bool = typer.Option(
@@ -62,6 +67,12 @@ def main(
     cache: bool = typer.Option(
         True,
         help="Cache completion results.",
+    ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Show version.",
+        callback=get_sgpt_version,
     ),
     chat: str = typer.Option(
         None,
@@ -108,6 +119,12 @@ def main(
         callback=SystemRole.list,
         rich_help_panel="Role Options",
     ),
+    install_integration: bool = typer.Option(
+        False,
+        help="Install shell integration (ZSH and Bash only)",
+        callback=install_shell_integration,
+        hidden=True,  # Hiding since should be used only once.
+    ),
 ) -> None:
     stdin_passed = not sys.stdin.isatty()
 
@@ -117,8 +134,10 @@ def main(
     if not prompt and not editor and not repl:
         raise MissingParameter(param_hint="PROMPT", param_type="string")
 
-    if shell and code:
-        raise BadArgumentUsage("--shell and --code options cannot be used together.")
+    if sum((shell, describe_shell, code)) > 1:
+        raise BadArgumentUsage(
+            "Only one of --shell, --describe-shell, and --code options can be used at a time."
+        )
 
     if chat and repl:
         raise BadArgumentUsage("--chat and --repl options cannot be used together.")
@@ -129,45 +148,65 @@ def main(
     if editor:
         prompt = get_edited_prompt()
 
-    client = OpenAIClient(cfg.get("OPENAI_API_HOST"), cfg.get("OPENAI_API_KEY"))
-
-    role_class = DefaultRoles.get(shell, code) if not role else SystemRole.get(role)
+    role_class = (
+        DefaultRoles.check_get(shell, describe_shell, code)
+        if not role
+        else SystemRole.get(role)
+    )
 
     if repl:
         # Will be in infinite loop here until user exits with Ctrl+C.
-        ReplHandler(client, repl, role_class).handle(
+        ReplHandler(repl, role_class).handle(
             prompt,
-            model=model.value,
+            model=model,
             temperature=temperature,
-            top_probability=top_probability,
+            top_p=top_probability,
             chat_id=repl,
             caching=cache,
         )
 
     if chat:
-        full_completion = ChatHandler(client, chat, role_class).handle(
+        full_completion = ChatHandler(chat, role_class).handle(
             prompt,
-            model=model.value,
+            model=model,
             temperature=temperature,
-            top_probability=top_probability,
+            top_p=top_probability,
             chat_id=chat,
             caching=cache,
         )
     else:
-        full_completion = DefaultHandler(client, role_class).handle(
+        full_completion = DefaultHandler(role_class).handle(
             prompt,
-            model=model.value,
+            model=model,
             temperature=temperature,
-            top_probability=top_probability,
+            top_p=top_probability,
             caching=cache,
         )
 
-    if shell and not stdin_passed and typer.confirm("Execute shell command?"):
-        run_command(full_completion)
+    while shell and not stdin_passed:
+        option = typer.prompt(
+            text="[E]xecute, [D]escribe, [A]bort",
+            type=Choice(("e", "d", "a", "y"), case_sensitive=False),
+            default="e" if cfg.get("DEFAULT_EXECUTE_SHELL_CMD") == "true" else "a",
+            show_choices=False,
+            show_default=False,
+        )
+        if option in ("e", "y"):
+            # "y" option is for keeping compatibility with old version.
+            run_command(full_completion)
+        elif option == "d":
+            DefaultHandler(DefaultRoles.DESCRIBE_SHELL.get_role()).handle(
+                full_completion,
+                model=model,
+                temperature=temperature,
+                top_p=top_probability,
+                caching=cache,
+            )
+            continue
+        break
 
 
 def entry_point() -> None:
-    # Python package entry point defined in setup.py
     typer.run(main)
 
 
